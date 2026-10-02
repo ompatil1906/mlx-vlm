@@ -64,6 +64,31 @@ def _drop_surplus_image_tokens(
     return text
 
 
+def _group_timestamps(frames_indices, source_fps, temporal_patch_size, grid_t):
+    """Mean timestamp of each temporal group, matching transformers Qwen3-VL.
+
+    A frame's time is its source index divided by the source fps. Groups merge
+    ``temporal_patch_size`` frames, and the marker is the mean of the first and
+    last frame in the group (the reference ``_calculate_timestamps``).
+    """
+    if frames_indices is None or source_fps is None or source_fps <= 0 or grid_t <= 0:
+        return None
+    indices = list(frames_indices)
+    if not indices:
+        return None
+    remainder = len(indices) % temporal_patch_size
+    if remainder:
+        indices.extend([indices[-1]] * (temporal_patch_size - remainder))
+    times = [idx / float(source_fps) for idx in indices]
+    grouped = [
+        (times[i] + times[i + temporal_patch_size - 1]) / 2
+        for i in range(0, len(times), temporal_patch_size)
+    ]
+    if len(grouped) < grid_t:
+        grouped.extend([grouped[-1]] * (grid_t - len(grouped)))
+    return grouped[:grid_t]
+
+
 def _timestamped_video_placeholder(
     grid_t: int,
     frame_seqlen: int,
@@ -71,16 +96,22 @@ def _timestamped_video_placeholder(
     fps: float,
     vision_start_token: str,
     vision_end_token: str,
+    timestamps=None,
 ) -> str:
     """Render one ``<t.t seconds>`` marker plus vision block per temporal group.
 
     The timestamp is the mean of the first and last frame of each group, the
-    convention used by the reference Qwen3-VL processor.
+    convention used by the reference Qwen3-VL processor. ``timestamps`` carries
+    those means when the sampled frame indices are known; otherwise the frames
+    are treated as evenly spaced at ``fps``.
     """
     parts = []
     for group in range(grid_t):
-        first = group * temporal_patch_size
-        seconds = (first + first + temporal_patch_size - 1) / 2 / fps
+        if timestamps is not None:
+            seconds = timestamps[group]
+        else:
+            first = group * temporal_patch_size
+            seconds = (first + first + temporal_patch_size - 1) / 2 / fps
         parts.append(
             f"<{seconds:.1f} seconds>"
             + vision_start_token
@@ -775,6 +806,8 @@ class Qwen3VLProcessor(ProcessorMixin):
             ]
         ] = None,
         videos=None,
+        fps=None,
+        video_metadata=None,
         **kwargs,
     ) -> BatchFeature:
         image_inputs = {}
@@ -840,24 +873,51 @@ class Qwen3VLProcessor(ProcessorMixin):
         # vision_start/vision_end block per temporal patch group, exactly as the
         # reference processor renders videos. Without the markers the model sees
         # one timeless block of frames and describes motion as a spatial collage.
-        fps_list = kwargs.pop("fps", None)
+        # Named parameters so process_inputs forwards them. They used to arrive
+        # only via **kwargs, which inspect.signature drops, so every clip was
+        # stamped at the video processor's default fps.
+        fps_list = fps if fps is not None else kwargs.pop("fps", None)
+        metadata_list = (
+            video_metadata
+            if video_metadata is not None
+            else kwargs.pop("video_metadata", None)
+        )
         if video_grid_thw is not None:
             _video_proc = self.video_processor or self.image_processor
             merge_length = _video_proc.merge_size**2
             temporal_patch_size = getattr(_video_proc, "temporal_patch_size", 2)
+            if metadata_list is not None and not isinstance(metadata_list, (list, tuple)):
+                metadata_list = [metadata_list]
             index = 0
             for i in range(len(text)):
                 while self.video_token in text[i]:
                     grid_t = int(video_grid_thw[index][0])
                     frame_seqlen = int(video_grid_thw[index][1:].prod() // merge_length)
-                    fps = (
+                    video_fps = (
                         fps_list[index]
                         if isinstance(fps_list, (list, tuple))
                         else fps_list
                     )
                     # Same fallback idea as the reference processor: use the
                     # configured sampling rate when no per-video fps was given.
-                    fps = fps or getattr(_video_proc, "fps", None) or 2.0
+                    video_fps = video_fps or getattr(_video_proc, "fps", None) or 2.0
+                    metadata = (
+                        metadata_list[index]
+                        if metadata_list is not None and index < len(metadata_list)
+                        else None
+                    )
+                    frames_indices = getattr(metadata, "frames_indices", None)
+                    if frames_indices is None and isinstance(metadata, dict):
+                        frames_indices = metadata.get("frames_indices")
+                    source_fps = getattr(metadata, "fps", None)
+                    if source_fps is None and isinstance(metadata, dict):
+                        source_fps = metadata.get("fps")
+                    timestamps = _group_timestamps(
+                        frames_indices,
+                        source_fps,
+                        temporal_patch_size,
+                        grid_t,
+                    )
                     wrapped = f"{self.vision_start_token}{self.video_token}{self.vision_end_token}"
                     if wrapped in text[i]:
                         text[i] = text[i].replace(
@@ -866,9 +926,10 @@ class Qwen3VLProcessor(ProcessorMixin):
                                 grid_t,
                                 frame_seqlen,
                                 temporal_patch_size,
-                                float(fps),
+                                float(video_fps),
                                 self.vision_start_token,
                                 self.vision_end_token,
+                                timestamps,
                             ),
                             1,
                         )

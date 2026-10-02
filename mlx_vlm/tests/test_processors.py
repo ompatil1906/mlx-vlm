@@ -1285,6 +1285,42 @@ def test_qwen3_vl_video_timestamp_video_prompt_falls_back_to_processor_fps():
     assert "<0.2 seconds>" in rendered and "<1.2 seconds>" in rendered
 
 
+def test_qwen3_vl_video_timestamps_follow_sampled_frames_not_default_fps():
+    """fps and video_metadata must be named parameters so prepare_inputs forwards them.
+
+    A 60s/30fps clip sampled down to 4 frames used to be stamped at the video
+    processor default of 2 fps, compressing the timeline to about 1.2s.
+    """
+    import inspect
+
+    p = _make_processor("qwen3_vl")
+    assert "fps" in inspect.signature(p).parameters
+    assert "video_metadata" in inspect.signature(p).parameters
+    p.tokenizer = ProcessorTokenizer(
+        {"<|video_pad|>": 102}, video_token="<|video_pad|>"
+    )
+    p.image_processor = None
+    p.video_processor = _stub("qwen_video")
+    p.vision_start_token, p.vision_end_token = ("<|vision_start|>", "<|vision_end|>")
+    p.vision_start_token_id, p.vision_end_token_id = (58, 59)
+    metadata = VideoMetadata(
+        total_num_frames=1800,
+        fps=30.0,
+        frames_indices=[0, 600, 1200, 1799],
+    )
+    p(
+        text=["<|vision_start|><|video_pad|><|vision_end|>Describe the clip."],
+        videos=["clip.mp4"],
+        fps=[metadata.sampled_fps],
+        video_metadata=[metadata],
+    )
+    rendered = p.tokenizer.last_text[0]
+    # temporal_patch_size=2 groups (0, 600) and (1200, 1799) at 30 fps.
+    assert "<10.0 seconds>" in rendered
+    assert "<50.0 seconds>" in rendered
+    assert "<0.2 seconds>" not in rendered
+
+
 class TestMageVLProcessor:
     """Mage VL image/video processing and processor-to-model compatibility."""
 
